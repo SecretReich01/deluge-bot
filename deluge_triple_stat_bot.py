@@ -1,13 +1,13 @@
 """
 DelugeRPG Triple Stat Trade Shop Monitor - Discord Bot
 =======================================================
-Uses browser cookies to bypass Cloudflare protection.
-Monitors trade shop for Pokemon with all 3 stats (+atk +def +spe).
+Uses curl_cffi to impersonate Chrome TLS fingerprint
+and bypass Cloudflare protection.
 """
 
 import discord
 import asyncio
-import requests
+from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 import logging
 import os
@@ -20,10 +20,6 @@ DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID", "0"))
 CHANNEL_ID      = int(os.environ.get("CHANNEL_ID", "0"))
 DELUGE_USERNAME = os.environ.get("DELUGE_USERNAME", "")
 DELUGE_PASSWORD = os.environ.get("DELUGE_PASSWORD", "")
-
-# Browser cookies to bypass Cloudflare
-CF_CLEARANCE    = os.environ.get("CF_CLEARANCE", "")
-PHPSESSID       = os.environ.get("PHPSESSID", "")
 
 CHECK_INTERVAL = 60
 
@@ -44,60 +40,32 @@ class DelugeSession:
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.session  = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://www.delugerpg.com/",
-        })
+        # curl_cffi impersonates Chrome's real TLS fingerprint
+        self.session = curl_requests.Session(impersonate="chrome120")
         self._logged_in = False
 
-    def inject_cookies(self):
-        """Inject browser cookies to bypass Cloudflare."""
-        if CF_CLEARANCE:
-            self.session.cookies.set("cf_clearance", CF_CLEARANCE, domain=".delugerpg.com")
-            log.info("Injected cf_clearance cookie")
-        if PHPSESSID:
-            self.session.cookies.set("PHPSESSID", PHPSESSID, domain=".delugerpg.com")
-            log.info("Injected PHPSESSID cookie")
-
     def login(self):
-        """Inject cookies first, then try login if needed."""
-        self.inject_cookies()
-
         try:
-            # First test if cookies already give us a logged-in session
-            log.info("Testing if cookies provide a valid session...")
-            r = self.session.get(BASE_URL, timeout=30)
-            log.info("Homepage status: %d, length: %d", r.status_code, len(r.text))
-
-            if r.status_code == 403 or "Just a moment" in r.text:
-                log.error("Still blocked by Cloudflare — cookies may be expired")
-                return False
-
-            if self.username.lower() in r.text.lower() or "logout" in r.text.lower():
-                log.info("✅ Already logged in via cookies!")
-                self._logged_in = True
-                return True
-
-            # Cookies got past Cloudflare but not logged in — do login
-            log.info("Past Cloudflare, but not logged in. Attempting login...")
+            log.info("Fetching login page with Chrome TLS impersonation...")
             r = self.session.get(LOGIN_URL, timeout=30)
             log.info("Login page status: %d, length: %d", r.status_code, len(r.text))
 
+            # Check if Cloudflare still blocks us
             if r.status_code == 403:
-                log.error("Login page blocked (403)")
+                log.error("Still getting 403 — checking response...")
+                log.info("Response snippet: %s", r.text[:300])
                 return False
+
+            if "Just a moment" in r.text:
+                log.error("Cloudflare JS challenge — curl_cffi not enough")
+                return False
+
+            log.info("✅ Got past Cloudflare!")
 
             soup = BeautifulSoup(r.text, "html.parser")
             payload = {"username": self.username, "password": self.password}
 
+            # Grab hidden form fields (CSRF etc.)
             form = soup.find("form")
             if form:
                 for hidden in form.find_all("input", {"type": "hidden"}):
@@ -106,22 +74,38 @@ class DelugeSession:
                     if name:
                         payload[name] = value
                         log.info("Hidden field: %s", name)
+            else:
+                log.warning("No form found on login page")
+                # Log more of the page to debug
+                log.info("Page title: %s", soup.title.string if soup.title else "None")
+                log.info("Page snippet: %s", r.text[:500])
 
-            resp = self.session.post(LOGIN_URL, data=payload, timeout=30, allow_redirects=True)
-            log.info("Login POST status: %d, url: %s", resp.status_code, resp.url)
+            log.info("Submitting login for '%s'...", self.username)
+            resp = self.session.post(
+                LOGIN_URL,
+                data=payload,
+                timeout=30,
+                allow_redirects=True,
+            )
+            log.info("Login POST status: %d, final url: %s", resp.status_code, resp.url)
 
-            if self.username.lower() in resp.text.lower() or "logout" in resp.text.lower():
+            # Verify login
+            page_text = resp.text.lower()
+            if self.username.lower() in page_text:
                 log.info("✅ Logged in as '%s'", self.username)
                 self._logged_in = True
-
-                # Save the new PHPSESSID for next time
-                new_sess = self.session.cookies.get("PHPSESSID")
-                if new_sess:
-                    log.info("New PHPSESSID obtained: %s...", new_sess[:20])
+                return True
+            elif "logout" in page_text or "log out" in page_text:
+                log.info("✅ Login successful (logout link found)")
+                self._logged_in = True
+                return True
+            elif "dashboard" in resp.url or "home" in resp.url:
+                log.info("✅ Login successful (redirected to dashboard)")
+                self._logged_in = True
                 return True
             else:
-                log.warning("Login uncertain — proceeding anyway")
-                self._logged_in = True
+                log.warning("Login uncertain — response snippet: %s", resp.text[:300])
+                self._logged_in = True  # Try anyway
                 return True
 
         except Exception as e:
@@ -140,17 +124,15 @@ class DelugeSession:
             log.info("Trade page status: %d, length: %d", r.status_code, len(r.text))
 
             if r.status_code == 403 or "Just a moment" in r.text:
-                log.warning("Cloudflare blocked trade page — cookies expired?")
+                log.warning("Cloudflare blocked trade page")
                 self._logged_in = False
                 return []
 
-            if "/login" in r.url:
+            if "/login" in str(r.url):
                 log.warning("Redirected to login — session expired")
                 self._logged_in = False
                 self.login()
                 return []
-
-            r.raise_for_status()
 
         except Exception as e:
             log.error("Failed to fetch trade page: %s", e)
@@ -158,7 +140,6 @@ class DelugeSession:
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Debug: log page title
         title = soup.find("title")
         log.info("Page title: %s", title.get_text(strip=True) if title else "No title")
 
@@ -245,7 +226,7 @@ async def monitor_trades(deluge):
         try:
             channel = await client.fetch_channel(CHANNEL_ID)
         except Exception as e:
-            log.error("Failed to get channel %s: %s", CHANNEL_ID, e)
+            log.error("Cannot find channel %s: %s", CHANNEL_ID, e)
             return
 
     log.info("Trade monitor started — checking every %ds", CHECK_INTERVAL)
@@ -272,7 +253,7 @@ async def monitor_trades(deluge):
                 log.info("Alert sent for: %s by %s", listing["pokemon"], listing["seller"])
 
             if not listings:
-                log.info("No triple-stat trades found this cycle")
+                log.info("No triple-stat trades this cycle")
 
         except Exception as e:
             log.error("Scan error: %s", e)
@@ -284,10 +265,7 @@ async def monitor_trades(deluge):
 async def on_ready():
     log.info("Discord bot online as %s", client.user)
     deluge = DelugeSession(DELUGE_USERNAME, DELUGE_PASSWORD)
-    if deluge.login():
-        log.info("Session ready — starting monitor")
-    else:
-        log.error("⚠️ Login failed — bot will retry on first scan")
+    deluge.login()
     client.loop.create_task(monitor_trades(deluge))
 
 
@@ -297,18 +275,18 @@ async def on_message(message):
         return
     if message.content.lower() == "!status":
         await message.channel.send(
-            f"✅ Bot is running! Checking trade shop every **{CHECK_INTERVAL}s**.\n"
-            f"Alerts sent so far: **{len(alerted_keys)}**"
+            f"✅ Bot running! Checking every **{CHECK_INTERVAL}s**.\n"
+            f"Alerts sent: **{len(alerted_keys)}**"
         )
     elif message.content.lower() == "!clearcache":
         alerted_keys.clear()
-        await message.channel.send("🗑️ Alert cache cleared.")
+        await message.channel.send("🗑️ Cache cleared.")
     elif message.content.lower() == "!help":
         await message.channel.send(
-            "**DelugeRPG Triple Stat Trade Bot**\n"
-            "`!status`     — Show bot status\n"
-            "`!clearcache` — Clear seen listings cache\n"
-            "`!help`       — Show this message"
+            "**DelugeRPG Triple Stat Bot**\n"
+            "`!status`     — Bot status\n"
+            "`!clearcache` — Clear seen listings\n"
+            "`!help`       — This message"
         )
 
 
@@ -316,10 +294,10 @@ if __name__ == "__main__":
     missing = []
     if not DISCORD_TOKEN:   missing.append("DISCORD_TOKEN")
     if not CHANNEL_ID:      missing.append("CHANNEL_ID")
-    if not CF_CLEARANCE:    missing.append("CF_CLEARANCE")
-    if not PHPSESSID:       missing.append("PHPSESSID")
+    if not DELUGE_USERNAME: missing.append("DELUGE_USERNAME")
+    if not DELUGE_PASSWORD: missing.append("DELUGE_PASSWORD")
     if missing:
         print(f"❌ Missing env vars: {', '.join(missing)}")
     else:
-        log.info("Starting bot...")
+        log.info("Starting bot with curl_cffi Chrome impersonation...")
         client.run(DISCORD_TOKEN)
