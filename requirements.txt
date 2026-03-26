@@ -1,3 +1,3 @@
 discord.py
-curl_cffi
+playwright
 beautifulsoup4
