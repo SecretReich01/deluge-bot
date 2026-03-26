@@ -35,17 +35,17 @@ log = logging.getLogger("TripleStatBot")
 
 class DelugeSession:
     def __init__(self, username, password):
-        self.username  = username
-        self.password  = password
-        self.pw        = None
-        self.browser   = None
-        self.context   = None
-        self.page      = None
+        self.username   = username
+        self.password   = password
+        self.pw         = None
+        self.browser    = None
+        self.context    = None
+        self.page       = None
         self._logged_in = False
 
     async def start(self):
         log.info("Launching Chromium browser...")
-        self.pw = await async_playwright().start()
+        self.pw      = await async_playwright().start()
         self.browser = await self.pw.chromium.launch(
             headless=True,
             args=[
@@ -64,21 +64,24 @@ class DelugeSession:
             viewport={"width": 1920, "height": 1080},
         )
         self.page = await self.context.new_page()
-        log.info("✅ Browser launched")
+        log.info("✅ Browser launched successfully")
 
     async def wait_for_cloudflare(self, timeout=30):
         """Wait for Cloudflare challenge to auto-solve."""
         for i in range(timeout):
-            content = await self.page.content()
             title   = await self.page.title()
-            if "just a moment" not in title.lower() and "just a moment" not in content[:500].lower():
+            content = await self.page.content()
+            if (
+                "just a moment" not in title.lower()
+                and "just a moment" not in content[:500].lower()
+            ):
                 if i > 0:
-                    log.info("Cloudflare cleared after %ds", i)
+                    log.info("✅ Cloudflare cleared after %ds", i)
                 return True
             if i % 5 == 0:
-                log.info("Waiting for Cloudflare... (%ds)", i)
+                log.info("Waiting for Cloudflare... (%ds elapsed)", i)
             await asyncio.sleep(1)
-        log.error("Cloudflare did not clear after %ds", timeout)
+        log.error("❌ Cloudflare did not clear after %ds", timeout)
         return False
 
     async def login(self):
@@ -87,80 +90,117 @@ class DelugeSession:
 
         try:
             log.info("Navigating to login page...")
-            await self.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            await self.page.goto(
+                LOGIN_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
 
+            # Wait for Cloudflare to clear
             if not await self.wait_for_cloudflare():
+                log.error("Stuck on Cloudflare — cannot proceed")
                 return False
 
             title = await self.page.title()
-            log.info("Page title: %s", title)
+            log.info("Login page title: %s", title)
 
-            # Already logged in?
+            # Check if already logged in
             content = await self.page.content()
             if "logout" in content.lower():
                 log.info("✅ Already logged in!")
                 self._logged_in = True
                 return True
 
-            # Fill username
-            log.info("Filling login form for '%s'...", self.username)
-            username_ok = False
-            for sel in ['input[name="username"]', "#username", 'input[type="text"]']:
+            # Fill in username field
+            log.info("Filling username...")
+            filled_user = False
+            for sel in [
+                'input[name="username"]',
+                'input[name="user"]',
+                "#username",
+                "#user",
+                'input[type="text"]',
+            ]:
                 try:
-                    await self.page.fill(sel, self.username, timeout=5000)
-                    username_ok = True
-                    log.info("Username filled (%s)", sel)
+                    await self.page.wait_for_selector(sel, timeout=3000)
+                    await self.page.fill(sel, self.username)
+                    log.info("Username filled with selector: %s", sel)
+                    filled_user = True
                     break
                 except Exception:
                     continue
-            if not username_ok:
-                log.error("Could not find username field!")
-                log.info("Page snippet: %s", content[:800])
+
+            if not filled_user:
+                log.error("❌ Could not find username field")
+                log.info("Page HTML snippet: %s", content[:1000])
                 return False
 
-            # Fill password
-            password_ok = False
-            for sel in ['input[name="password"]', "#password", 'input[type="password"]']:
+            # Fill in password field
+            log.info("Filling password...")
+            filled_pass = False
+            for sel in [
+                'input[name="password"]',
+                'input[name="pass"]',
+                "#password",
+                "#pass",
+                'input[type="password"]',
+            ]:
                 try:
-                    await self.page.fill(sel, self.password, timeout=5000)
-                    password_ok = True
-                    log.info("Password filled (%s)", sel)
+                    await self.page.wait_for_selector(sel, timeout=3000)
+                    await self.page.fill(sel, self.password)
+                    log.info("Password filled with selector: %s", sel)
+                    filled_pass = True
                     break
                 except Exception:
                     continue
-            if not password_ok:
-                log.error("Could not find password field!")
+
+            if not filled_pass:
+                log.error("❌ Could not find password field")
                 return False
 
-            # Submit
-            log.info("Submitting login...")
+            # Submit the form
+            log.info("Submitting login form...")
             submitted = False
-            for sel in ['button[type="submit"]', 'input[type="submit"]', ".login-btn", "button"]:
+            for sel in [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("Login")',
+                'button:has-text("Log in")',
+                'button:has-text("Sign in")',
+                ".login-btn",
+                "button",
+            ]:
                 try:
-                    await self.page.click(sel, timeout=5000)
+                    await self.page.click(sel, timeout=3000)
+                    log.info("Clicked submit: %s", sel)
                     submitted = True
-                    log.info("Clicked submit (%s)", sel)
                     break
                 except Exception:
                     continue
-            if not submitted:
-                await self.page.keyboard.press("Enter")
-                log.info("Submitted via Enter key")
 
-            # Wait for navigation
+            if not submitted:
+                log.info("No button found — pressing Enter")
+                await self.page.keyboard.press("Enter")
+
+            # Wait for page to load after login
             await self.page.wait_for_load_state("networkidle", timeout=30000)
             await self.wait_for_cloudflare()
 
-            content = await self.page.content()
-            url     = self.page.url
-            log.info("Post-login URL: %s", url)
+            final_url = self.page.url
+            content   = await self.page.content()
+            log.info("Post-login URL: %s", final_url)
 
-            if self.username.lower() in content.lower() or "logout" in content.lower():
-                log.info("✅ Login successful!")
+            if (
+                self.username.lower() in content.lower()
+                or "logout" in content.lower()
+                or "log out" in content.lower()
+            ):
+                log.info("✅ Login confirmed!")
                 self._logged_in = True
                 return True
             else:
-                log.warning("Login uncertain — proceeding anyway")
+                log.warning("⚠️ Login result unclear — proceeding anyway")
+                log.info("Page snippet: %s", content[:400])
                 self._logged_in = True
                 return True
 
@@ -176,21 +216,31 @@ class DelugeSession:
 
         try:
             log.info("Navigating to trade page...")
-            await self.page.goto(TRADE_URL, wait_until="domcontentloaded", timeout=60000)
+            await self.page.goto(
+                TRADE_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
 
             if not await self.wait_for_cloudflare():
+                log.warning("Cloudflare blocked trade page")
                 self._logged_in = False
                 return []
 
-            await asyncio.sleep(2)  # let page render
+            # Extra wait for dynamic content
+            await asyncio.sleep(3)
 
-            content = await self.page.content()
-            title   = await self.page.title()
-            url     = self.page.url
-            log.info("Trade page — title: %s, url: %s, len: %d", title, url, len(content))
+            current_url = self.page.url
+            content     = await self.page.content()
+            title       = await self.page.title()
+            log.info(
+                "Trade page — title: %s | url: %s | length: %d",
+                title, current_url, len(content),
+            )
 
-            if "/login" in url:
-                log.warning("Redirected to login — re-logging in")
+            # Redirected to login?
+            if "/login" in current_url:
+                log.warning("Redirected to login — session expired, re-logging in")
                 self._logged_in = False
                 await self.login()
                 return []
@@ -206,7 +256,7 @@ class DelugeSession:
         if not rows:
             rows = soup.find_all("tr")
 
-        log.info("Found %d rows to scan", len(rows))
+        log.info("Scanning %d rows...", len(rows))
 
         for row in rows:
             text = row.get_text(" ", strip=True)
@@ -222,7 +272,9 @@ class DelugeSession:
             detail_url = ""
             if link_tag:
                 href = link_tag["href"]
-                detail_url = href if href.startswith("http") else BASE_URL + href
+                detail_url = (
+                    href if href.startswith("http") else BASE_URL + href
+                )
 
             listings.append({
                 "pokemon": pokemon_name,
@@ -236,10 +288,13 @@ class DelugeSession:
         return listings
 
     async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.pw:
-            await self.pw.stop()
+        try:
+            if self.browser:
+                await self.browser.close()
+            if self.pw:
+                await self.pw.stop()
+        except Exception:
+            pass
 
 
 def _extract_pokemon_name(row, text):
@@ -251,9 +306,15 @@ def _extract_pokemon_name(row, text):
         if el:
             return el.get_text(strip=True)
     for token in text.split():
-        if token and token[0].isupper() and token.isalpha() and len(token) > 2:
-            if token.lower() not in {"the", "and", "for", "has", "with", "your", "trade"}:
-                return token
+        if (
+            token
+            and token[0].isupper()
+            and token.isalpha()
+            and len(token) > 2
+            and token.lower()
+            not in {"the", "and", "for", "has", "with", "your", "trade", "shop"}
+        ):
+            return token
     return "Unknown Pokemon"
 
 
@@ -276,6 +337,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client  = discord.Client(intents=intents)
 alerted_keys: set = set()
+deluge_session: DelugeSession = None
 
 
 def listing_key(listing):
@@ -284,6 +346,7 @@ def listing_key(listing):
 
 async def monitor_trades(deluge):
     await client.wait_until_ready()
+
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
         try:
@@ -292,12 +355,14 @@ async def monitor_trades(deluge):
             log.error("Cannot find channel %s: %s", CHANNEL_ID, e)
             return
 
-    log.info("Trade monitor started — checking every %ds", CHECK_INTERVAL)
+    log.info("✅ Trade monitor started — checking every %ds", CHECK_INTERVAL)
 
     while not client.is_closed():
         try:
             listings     = await deluge.fetch_triple_stat_trades()
-            new_listings = [l for l in listings if listing_key(l) not in alerted_keys]
+            new_listings = [
+                l for l in listings if listing_key(l) not in alerted_keys
+            ]
 
             for listing in new_listings:
                 key = listing_key(listing)
@@ -313,10 +378,15 @@ async def monitor_trades(deluge):
                     f"{url_line}"
                 )
                 await channel.send(msg)
-                log.info("Alert sent: %s by %s", listing["pokemon"], listing["seller"])
+                log.info(
+                    "Alert sent: %s by %s", listing["pokemon"], listing["seller"]
+                )
 
-            if not listings:
-                log.info("No triple-stat trades this cycle")
+            if not new_listings:
+                log.info(
+                    "No new triple-stat trades this cycle (total found: %d)",
+                    len(listings),
+                )
 
         except Exception as e:
             log.error("Scan error: %s", e)
@@ -326,17 +396,22 @@ async def monitor_trades(deluge):
 
 @client.event
 async def on_ready():
+    global deluge_session
     log.info("Discord bot online as %s", client.user)
-    deluge = DelugeSession(DELUGE_USERNAME, DELUGE_PASSWORD)
-    await deluge.login()
-    client.loop.create_task(monitor_trades(deluge))
+    deluge_session = DelugeSession(DELUGE_USERNAME, DELUGE_PASSWORD)
+    success = await deluge_session.login()
+    if success:
+        log.info("✅ Session ready — starting monitor")
+    else:
+        log.error("⚠️ Login failed — will retry on first scan")
+    asyncio.ensure_future(monitor_trades(deluge_session))
 
 
 @client.event
 async def on_message(message):
     if message.author == client.user:
         return
-    cmd = message.content.lower()
+    cmd = message.content.lower().strip()
     if cmd == "!status":
         await message.channel.send(
             f"✅ Bot running! Checking every **{CHECK_INTERVAL}s**.\n"
@@ -344,7 +419,7 @@ async def on_message(message):
         )
     elif cmd == "!clearcache":
         alerted_keys.clear()
-        await message.channel.send("🗑️ Cache cleared.")
+        await message.channel.send("🗑️ Alert cache cleared.")
     elif cmd == "!help":
         await message.channel.send(
             "**DelugeRPG Triple Stat Bot**\n"
@@ -363,5 +438,5 @@ if __name__ == "__main__":
     if missing:
         print(f"❌ Missing env vars: {', '.join(missing)}")
     else:
-        log.info("Starting bot with Playwright (Chromium)...")
+        log.info("Starting bot with Playwright Chromium...")
         client.run(DISCORD_TOKEN)
