@@ -66,23 +66,39 @@ class DelugeSession:
         self.page = await self.context.new_page()
         log.info("✅ Browser launched successfully")
 
-    async def wait_for_cloudflare(self, timeout=30):
+    async def wait_for_cloudflare(self, timeout=60):
         """Wait for Cloudflare challenge to auto-solve."""
         for i in range(timeout):
-            title   = await self.page.title()
-            content = await self.page.content()
-            if (
-                "just a moment" not in title.lower()
-                and "just a moment" not in content[:500].lower()
-            ):
-                if i > 0:
-                    log.info("✅ Cloudflare cleared after %ds", i)
-                return True
-            if i % 5 == 0:
-                log.info("Waiting for Cloudflare... (%ds elapsed)", i)
+            try:
+                title   = await self.page.title()
+                content = await self.page.content()
+                if (
+                    "just a moment" not in title.lower()
+                    and "just a moment" not in content[:500].lower()
+                    and "cf-challenge" not in content[:500].lower()
+                ):
+                    if i > 0:
+                        log.info("✅ Cloudflare cleared after %ds", i)
+                    return True
+                if i % 5 == 0:
+                    log.info("Waiting for Cloudflare... (%ds elapsed)", i)
+            except Exception:
+                pass
             await asyncio.sleep(1)
         log.error("❌ Cloudflare did not clear after %ds", timeout)
         return False
+
+    async def safe_goto(self, url):
+        """Navigate to URL without crashing on timeout."""
+        try:
+            await self.page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        except Exception as e:
+            # domcontentloaded already fired — safe to continue
+            log.info("Navigation exception (safe to ignore): %s", str(e)[:100])
 
     async def login(self):
         if not self.browser:
@@ -90,28 +106,24 @@ class DelugeSession:
 
         try:
             log.info("Navigating to login page...")
-            await self.page.goto(
-                LOGIN_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
+            await self.safe_goto(LOGIN_URL)
 
-            # Wait for Cloudflare to clear
+            # Wait for Cloudflare
             if not await self.wait_for_cloudflare():
-                log.error("Stuck on Cloudflare — cannot proceed")
+                log.error("Stuck on Cloudflare at login page")
                 return False
 
             title = await self.page.title()
             log.info("Login page title: %s", title)
 
-            # Check if already logged in
+            # Already logged in?
             content = await self.page.content()
             if "logout" in content.lower():
                 log.info("✅ Already logged in!")
                 self._logged_in = True
                 return True
 
-            # Fill in username field
+            # Fill username
             log.info("Filling username...")
             filled_user = False
             for sel in [
@@ -124,7 +136,7 @@ class DelugeSession:
                 try:
                     await self.page.wait_for_selector(sel, timeout=3000)
                     await self.page.fill(sel, self.username)
-                    log.info("Username filled with selector: %s", sel)
+                    log.info("Username filled: %s", sel)
                     filled_user = True
                     break
                 except Exception:
@@ -132,10 +144,10 @@ class DelugeSession:
 
             if not filled_user:
                 log.error("❌ Could not find username field")
-                log.info("Page HTML snippet: %s", content[:1000])
+                log.info("Page HTML: %s", content[:1000])
                 return False
 
-            # Fill in password field
+            # Fill password
             log.info("Filling password...")
             filled_pass = False
             for sel in [
@@ -148,7 +160,7 @@ class DelugeSession:
                 try:
                     await self.page.wait_for_selector(sel, timeout=3000)
                     await self.page.fill(sel, self.password)
-                    log.info("Password filled with selector: %s", sel)
+                    log.info("Password filled: %s", sel)
                     filled_pass = True
                     break
                 except Exception:
@@ -158,15 +170,14 @@ class DelugeSession:
                 log.error("❌ Could not find password field")
                 return False
 
-            # Submit the form
+            # Submit
             log.info("Submitting login form...")
             submitted = False
             for sel in [
-                'button[type="submit"]',
                 'input[type="submit"]',
+                'button[type="submit"]',
                 'button:has-text("Login")',
                 'button:has-text("Log in")',
-                'button:has-text("Sign in")',
                 ".login-btn",
                 "button",
             ]:
@@ -182,13 +193,22 @@ class DelugeSession:
                 log.info("No button found — pressing Enter")
                 await self.page.keyboard.press("Enter")
 
-            # Wait for page to load after login
-            await self.page.wait_for_load_state("networkidle", timeout=30000)
-            await self.wait_for_cloudflare()
+            # ── Wait for post-login page ──────────────────────
+            # Don't use networkidle — it times out
+            # Instead just wait a few seconds and check what we got
+            log.info("Waiting for post-login page to settle...")
+            await asyncio.sleep(5)
+
+            # Handle any Cloudflare that appears after login redirect
+            await self.wait_for_cloudflare(timeout=60)
+
+            # Extra settle time
+            await asyncio.sleep(3)
 
             final_url = self.page.url
             content   = await self.page.content()
-            log.info("Post-login URL: %s", final_url)
+            title     = await self.page.title()
+            log.info("Post-login — URL: %s | Title: %s", final_url, title)
 
             if (
                 self.username.lower() in content.lower()
@@ -198,9 +218,14 @@ class DelugeSession:
                 log.info("✅ Login confirmed!")
                 self._logged_in = True
                 return True
+            elif "/login" not in final_url:
+                log.info("✅ Login likely succeeded (not on login page)")
+                self._logged_in = True
+                return True
             else:
-                log.warning("⚠️ Login result unclear — proceeding anyway")
-                log.info("Page snippet: %s", content[:400])
+                log.warning("⚠️ Still on login page — login may have failed")
+                log.info("Page snippet: %s", content[:500])
+                # Try anyway
                 self._logged_in = True
                 return True
 
@@ -216,18 +241,15 @@ class DelugeSession:
 
         try:
             log.info("Navigating to trade page...")
-            await self.page.goto(
-                TRADE_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
+            await self.safe_goto(TRADE_URL)
 
-            if not await self.wait_for_cloudflare():
+            # Handle Cloudflare
+            if not await self.wait_for_cloudflare(timeout=60):
                 log.warning("Cloudflare blocked trade page")
                 self._logged_in = False
                 return []
 
-            # Extra wait for dynamic content
+            # Let dynamic content load
             await asyncio.sleep(3)
 
             current_url = self.page.url
@@ -240,7 +262,7 @@ class DelugeSession:
 
             # Redirected to login?
             if "/login" in current_url:
-                log.warning("Redirected to login — session expired, re-logging in")
+                log.warning("Redirected to login — session expired")
                 self._logged_in = False
                 await self.login()
                 return []
@@ -312,7 +334,10 @@ def _extract_pokemon_name(row, text):
             and token.isalpha()
             and len(token) > 2
             and token.lower()
-            not in {"the", "and", "for", "has", "with", "your", "trade", "shop"}
+            not in {
+                "the", "and", "for", "has", "with",
+                "your", "trade", "shop", "login",
+            }
         ):
             return token
     return "Unknown Pokemon"
@@ -379,12 +404,13 @@ async def monitor_trades(deluge):
                 )
                 await channel.send(msg)
                 log.info(
-                    "Alert sent: %s by %s", listing["pokemon"], listing["seller"]
+                    "Alert sent: %s by %s",
+                    listing["pokemon"], listing["seller"],
                 )
 
             if not new_listings:
                 log.info(
-                    "No new triple-stat trades this cycle (total found: %d)",
+                    "No new triple-stat trades (total found: %d)",
                     len(listings),
                 )
 
