@@ -1,3 +1,3 @@
-discord
-requests
+discord.py
+cloudscraper
 beautifulsoup4
