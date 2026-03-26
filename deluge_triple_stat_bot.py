@@ -7,7 +7,7 @@ and pings you on Discord when one appears.
 
 import discord
 import asyncio
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import logging
 import os
@@ -40,21 +40,33 @@ class DelugeSession:
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.session  = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        })
+        # cloudscraper handles Cloudflare challenges automatically
+        self.session  = cloudscraper.create_scraper(
+            browser={
+                "browser": "chrome",
+                "platform": "windows",
+                "desktop": True,
+            }
+        )
         self._logged_in = False
+        self._login_attempts = 0
 
     def login(self):
+        self._login_attempts += 1
         try:
-            r    = self.session.get(LOGIN_URL, timeout=15)
+            log.info("Login attempt #%d — fetching login page...", self._login_attempts)
+            r = self.session.get(LOGIN_URL, timeout=30)
+            log.info("Login page status: %d, length: %d", r.status_code, len(r.text))
+
+            # Check if we're stuck on a Cloudflare challenge
+            if "Just a moment" in r.text or "cf-challenge" in r.text:
+                log.warning("Cloudflare challenge detected on login page!")
+                return False
+
             soup = BeautifulSoup(r.text, "html.parser")
             payload = {"username": self.username, "password": self.password}
+
+            # Grab all hidden form fields (CSRF tokens, etc.)
             form = soup.find("form")
             if form:
                 for hidden in form.find_all("input", {"type": "hidden"}):
@@ -62,24 +74,57 @@ class DelugeSession:
                     value = hidden.get("value", "")
                     if name:
                         payload[name] = value
-            resp = self.session.post(LOGIN_URL, data=payload, timeout=15, allow_redirects=True)
+                        log.info("Found hidden field: %s", name)
+
+            log.info("Submitting login for user '%s'...", self.username)
+            resp = self.session.post(LOGIN_URL, data=payload, timeout=30, allow_redirects=True)
+            log.info("Login response status: %d, url: %s", resp.status_code, resp.url)
+
+            # Check for successful login
             if self.username.lower() in resp.text.lower():
-                log.info("Logged in to DelugeRPG as '%s'", self.username)
+                log.info("✅ Logged in to DelugeRPG as '%s'", self.username)
+                self._logged_in = True
+                return True
+            elif "logout" in resp.text.lower():
+                log.info("✅ Login appears successful (found logout link)")
+                self._logged_in = True
+                return True
             else:
-                log.warning("Login response did not confirm username — proceeding anyway.")
-            self._logged_in = True
-            return True
+                log.warning("⚠️ Login may have failed — username not found in response")
+                # Log a snippet to help debug
+                log.debug("Response snippet: %s", resp.text[:500])
+                self._logged_in = True  # Try anyway
+                return True
+
         except Exception as e:
-            log.error("Login error: %s", e)
+            log.error("❌ Login error: %s", e)
             return False
 
     def fetch_triple_stat_trades(self):
         if not self._logged_in:
-            self.login()
+            if not self.login():
+                log.error("Cannot fetch trades — login failed")
+                return []
 
         try:
-            r = self.session.get(TRADE_URL, timeout=20)
+            log.info("Fetching trade page...")
+            r = self.session.get(TRADE_URL, timeout=30)
             r.raise_for_status()
+            log.info("Trade page status: %d, length: %d", r.status_code, len(r.text))
+
+            # Check for Cloudflare block
+            if "Just a moment" in r.text or "cf-challenge" in r.text:
+                log.warning("Cloudflare challenge on trade page — re-login needed")
+                self._logged_in = False
+                return []
+
+            # Check if we got redirected to login
+            if "/login" in r.url:
+                log.warning("Redirected to login — session expired, re-logging in")
+                self._logged_in = False
+                self.login()
+                return []
+
         except Exception as e:
             log.error("Failed to fetch trade page: %s", e)
             return []
@@ -87,10 +132,16 @@ class DelugeSession:
         soup     = BeautifulSoup(r.text, "html.parser")
         listings = []
 
+        # Log page title for debugging
+        title = soup.find("title")
+        log.info("Page title: %s", title.get_text(strip=True) if title else "No title")
+
         # Try common row selectors
         rows = soup.select("tr, .trade-item, .trade-row, .pokemon-trade")
         if not rows:
             rows = soup.find_all("tr")
+
+        log.info("Found %d rows to scan", len(rows))
 
         for row in rows:
             text = row.get_text(" ", strip=True)
@@ -166,8 +217,13 @@ async def monitor_trades(deluge):
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
-        log.error("Could not find channel ID %s", CHANNEL_ID)
-        return
+        log.error("Could not find channel ID %s — trying to fetch...", CHANNEL_ID)
+        try:
+            channel = await client.fetch_channel(CHANNEL_ID)
+        except Exception as e:
+            log.error("Failed to fetch channel: %s", e)
+            return
+
     log.info("Trade shop monitor started. Checking every %ds.", CHECK_INTERVAL)
 
     while not client.is_closed():
